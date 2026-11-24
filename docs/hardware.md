@@ -43,11 +43,11 @@ flowchart LR
     ui("MainWindow") -->|manual on/off| worker("LaserWorker")
     scan("ScanWorker") -->|scan on/off| worker
     worker -->|SetOutput| wrapper("Pcie6323Laser wrapper")
-    wrapper -->|DAQmxWriteDigitalScalarU32| driver("NI-DAQmx")
+    wrapper -->|DAQmxWriteDigitalLines| driver("NI-DAQmx")
     driver --> line("Configured PCIe-6323 digital line")
 ```
 
-The wrapper checks the DAQ model and configured serial (default `0185BDED`). Digital mode requires confirmed high-on, low-off wiring and the actual output line. The worker reports whether the DAQ write succeeded. Optical output is unmeasured.
+For confirmed high-on, low-off wiring, build with `-DPCIE6323_LASER_MODE=digital`. In the Laser tab, enter the NI MAX device name and select the wired port and line before connecting. The wrapper checks the DAQ model and configured serial (default `0185BDED`) and starts the selected line LOW. Manual and scan commands write HIGH or LOW to that line. Disconnect to change the selection. The worker reports whether the DAQ write succeeded. Optical output is unmeasured.
 
 ## Component inventory
 

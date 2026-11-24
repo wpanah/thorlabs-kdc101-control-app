@@ -40,6 +40,20 @@ cmake --preset app -DCMAKE_PREFIX_PATH="C:/Qt/6.11.2/msvc2022_64" && cmake --bui
 
 Launch `build-app\Release\frontend.exe` to check that the runtime libraries load.
 
+## Package for an offline Windows lab PC
+
+On the development PC, configure the `app` preset as above. From the repository root, run the command below with the path to Microsoft's **x64 Visual C++ Redistributable** installer. Use a version at least as recent as the MSVC toolsets used for the app and Qt. A Qt installation may already contain the installer under `C:\Qt\vcredist`.
+
+```bat
+powershell -NoProfile -ExecutionPolicy RemoteSigned -File tools\package_windows.ps1 -VcRedist "C:\Qt\vcredist\vc14.50.35719_VC_redist.x64.exe"
+```
+
+The script builds Release with the configured hardware settings and writes `build-app\Confo-Quanta-win-x64.zip`. It includes the executable, Qt DLLs and plugins, the Microsoft runtime installer, and a launcher. The packaged `READ ME.txt` records the stage travels and laser mode. The default `unconfigured` mode disables laser output. See the [hardware profiles](docs/hardware.md) before choosing a different mode.
+
+1. Copy the ZIP onto the USB drive. The lab PC needs **64-bit Thorlabs Kinesis** and **NI-DAQmx** at startup. Laser Quantum RemoteApp uses a separate interface. On a 64-bit lab PC, check for `C:\Windows\System32\nicaiu.dll` in Explorer. If DAQmx is missing, bring the full [NI-DAQmx offline installer](https://knowledge.ni.com/KnowledgeArticleDetails?id=kA03q000000YGjPCAW) for the lab Windows version and PCIe-6323 on the same USB.
+2. On the lab PC, use **Extract All** to unpack the ZIP to a local folder. Run the included `vc_redist.x64.exe` once. If Windows already has an equal or newer runtime, keep it.
+3. Double-click **Start Confo Quanta.bat** in the extracted folder. It adds the default Kinesis installation directory to the application's search path for this launch. For a custom installation, add the directory containing `Thorlabs.MotionControl.Benchtop.StepperMotor.dll` to PATH. Keep the extracted files and subfolders together. The lab PC needs no Qt installation, compiler, or internet connection.
+
 # Documentation
 
 For architecture and design justifications please refer to the [documentation here](docs/README.md)

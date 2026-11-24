@@ -47,6 +47,8 @@ void ConnectStatusMessages(MainWindow& view) {
         const auto index = static_cast<int>(axis);
         if (index < 0 || index >= 3) return;
         QStringList applied;
+        if (settings.travel_limits)
+          applied << QObject::tr("software travel limits applied");
         if (settings.jog_step_mm)
           applied << QObject::tr("step size applied \u2014 %1 mm")
                          .arg(QString::number(*settings.jog_step_mm, 'g', 12));

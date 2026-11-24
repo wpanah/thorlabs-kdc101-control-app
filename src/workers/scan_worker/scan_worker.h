@@ -32,7 +32,9 @@ class ScanWorker final : public QObject {
                           double position_mm);
 
  signals:
-  void PositionRequested(workers::Axis axis, workers::RequestId id);
+  void PositionRequested(workers::Axis axis, workers::RequestId id,
+                         double minimum_offset_mm, double maximum_offset_mm,
+                         std::optional<double> exposed_end_offset_mm);
   void MoveRequested(workers::Axis axis, workers::RequestId id,
                      double position_mm);
   void StopRequested(workers::Axis axis, workers::RequestId id,

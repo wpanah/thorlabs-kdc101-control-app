@@ -7,6 +7,13 @@
 namespace NI_DAQ {
 namespace {
 constexpr double kWriteTimeoutSeconds = 1.0;
+int32 WriteLine(TaskHandle task, bool high) {
+  const uInt8 level = high ? 1 : 0;
+  return DAQmxWriteDigitalLines(task, 1, true, kWriteTimeoutSeconds,
+                                DAQmx_Val_GroupByChannel, &level, nullptr,
+                                nullptr);
+}
+
 Error ReadError(int32 code) {
   std::array<char, 4096> message{};
   DAQmxGetExtendedErrorInfo(message.data(),
@@ -51,7 +58,7 @@ Pcie6323Laser::CreateResult Pcie6323Laser::CreateLaser(
   }
 
   status = DAQmxCreateDOChan(laser->task_, channel.c_str(), "",
-                             DAQmx_Val_ChanForAllLines);
+                             DAQmx_Val_ChanPerLine);
   if (DAQmxFailed(status)) {
     return std::unexpected(ReadError(status));
   }
@@ -76,17 +83,14 @@ Pcie6323Laser::CreateResult Pcie6323Laser::CreateLaser(
 Pcie6323Laser::~Pcie6323Laser() noexcept {
   if (task_ != nullptr) {
     if (configured_) {
-      DAQmxWriteDigitalScalarU32(task_, true, kWriteTimeoutSeconds, 0u,
-                                 nullptr);
+      WriteLine(task_, false);
     }
     DAQmxClearTask(task_);
   }
 }
 
 Error Pcie6323Laser::Write(bool on) {
-  const uInt32 value = on ? 1u : 0u;
-  const int32 status = DAQmxWriteDigitalScalarU32(
-      task_, true, kWriteTimeoutSeconds, value, nullptr);
+  const int32 status = WriteLine(task_, on);
   if (DAQmxFailed(status)) {
     return ReadError(status);
   }

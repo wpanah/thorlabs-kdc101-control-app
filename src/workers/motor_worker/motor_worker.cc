@@ -1,5 +1,8 @@
 #include "motor_worker.h"
 
+#include <qt_windows.h>
+
+#include <QSettings>
 #include <array>
 #include <cmath>
 #include <utility>
@@ -73,9 +76,34 @@ void MotorWorker::ConnectDevice(RequestId id, QString serial_number,
   const auto stage = kStageTravelMm[axis_index] == 150
                          ? thorlabs::NRT100::StageModel::kNrt150M
                          : thorlabs::NRT100::StageModel::kNrt100M;
-  auto result =
-      thorlabs::NRT100::CreateMotor(serial_number.toStdString(), channel,
-                                    kPollIntervalMs, simulation_session, stage);
+  limits_key_ =
+      QString("TravelLimits/%1/%2/%3/NRT%4M")
+          .arg(simulation_session ? "simulation" : "hardware", serial_number)
+          .arg(channel)
+          .arg(kStageTravelMm[axis_index]);
+  QSettings preferences("Confo Quanta", "Motor Control");
+  std::optional<thorlabs::TravelLimits> limits;
+  if (preferences.contains(limits_key_)) {
+    const QVariantList pair = preferences.value(limits_key_).toList();
+    bool low_ok = false, high_ok = false;
+    const double low = pair.value(0).toDouble(&low_ok);
+    const double high = pair.value(1).toDouble(&high_ok);
+    if (pair.size() != 2 || !low_ok || !high_ok) {
+      emit RequestFinished(id,
+                           errors::Error::InvalidArgument(
+                               "Cannot read saved software travel limits."));
+      return;
+    }
+    limits = thorlabs::TravelLimits{low, high};
+  }
+  if (preferences.status() != QSettings::NoError) {
+    emit RequestFinished(id, errors::Error::InvalidArgument(
+                                 "Cannot read saved motor settings."));
+    return;
+  }
+  auto result = thorlabs::NRT100::CreateMotor(
+      serial_number.toStdString(), channel, kPollIntervalMs, simulation_session,
+      stage, limits);
   if (!result) {
     emit RequestFinished(id, result.error());
     return;
@@ -120,6 +148,19 @@ void MotorWorker::Configure(RequestId id, MotorSettings settings) {
     result = motor_->SetJogStepSize(*settings.jog_step_mm);
   if (result.ok() && settings.backlash_mm)
     result = motor_->SetBacklash(*settings.backlash_mm);
+  if (result.ok() && settings.travel_limits) {
+    const auto limits = *settings.travel_limits;
+    result = motor_->SetTravelLimits(limits);
+    if (result.ok()) {
+      QSettings preferences("Confo Quanta", "Motor Control");
+      preferences.setValue(limits_key_,
+                           QVariantList{limits.minimum_mm, limits.maximum_mm});
+      preferences.sync();
+      if (preferences.status() != QSettings::NoError)
+        result = errors::Error::InvalidArgument(
+            "Limits applied to this connection, but could not be saved.");
+    }
+  }
   // Read back even after a partial update; show device values, not requested
   // ones.
   const auto read_result = PublishSettings();
@@ -130,7 +171,10 @@ void MotorWorker::Configure(RequestId id, MotorSettings settings) {
 errors::Error MotorWorker::PublishSettings() {
   auto configuration = motor_->GetConfiguration();
   MotorSettings settings;
+  settings.travel_limits = motor_->GetTravelLimits();
   if (configuration) {
+    settings.move.speed_mm_per_second = configuration->move_speed_mm_per_second;
+    settings.jog_step_mm = configuration->jog_step_mm;
     settings.move.acceleration_mm_per_second_squared =
         configuration->acceleration_mm_per_second_squared;
     settings.homing_speed_mm_per_second =
@@ -143,16 +187,32 @@ errors::Error MotorWorker::PublishSettings() {
 
 void MotorWorker::StartMotion(RequestId id, thorlabs::MotorEvent completion,
                               std::function<errors::Error()> command,
-                              bool continuous) {
+                              bool drive) {
   if (!CheckReady(id)) return;
   auto result = motor_->ClearMessageQueue();
-  if (result.ok()) result = command();
   if (!result.ok()) {
     emit RequestFinished(id, result);
     return;
   }
-  pending_motion_ = PendingMotion{id, completion};
-  if (!continuous) motion_timer_->start(kMotionTimeoutMs);
+  // Each axis owns a dedicated thread. Keep its feedback and Stop processing
+  // running through an idle sleep timeout while this motion is outstanding.
+  const EXECUTION_STATE previous_state =
+      SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED);
+  if (previous_state == 0) {
+    emit RequestFinished(
+        id, errors::Error::Failure(
+                errors::ErrorCode::kControlDenied,
+                "Windows could not reserve awake time for motor motion."));
+    return;
+  }
+  result = command();
+  if (!result.ok()) {
+    SetThreadExecutionState(ES_CONTINUOUS | previous_state);
+    emit RequestFinished(id, result);
+    return;
+  }
+  pending_motion_ = PendingMotion{id, completion, drive, previous_state};
+  motion_timer_->start(kMotionTimeoutMs);
   PublishState();
 }
 
@@ -160,7 +220,9 @@ void MotorWorker::Home(RequestId id) {
   StartMotion(id, thorlabs::MotorEvent::kHomed,
               [this] { return motor_->StartHome(); });
 }
-void MotorWorker::CapturePosition(RequestId id) {
+void MotorWorker::CapturePosition(RequestId id, double minimum_offset_mm,
+                                  double maximum_offset_mm,
+                                  std::optional<double> exposed_end_offset_mm) {
   if (!CheckReady(id)) return;
   auto status = motor_->GetStatus();
   auto position = motor_->GetPosition();
@@ -174,21 +236,41 @@ void MotorWorker::CapturePosition(RequestId id) {
                                    "Scan origin requires a stopped motor."));
     return;
   }
+  const auto limits = motor_->GetTravelLimits();
+  if (!status->homed || !limits ||
+      !limits->Contains(*position + minimum_offset_mm) ||
+      !limits->Contains(*position + maximum_offset_mm)) {
+    emit RequestFinished(id, errors::Error::InvalidArgument(
+                                 "Scan requires a homed axis and a path within "
+                                 "its software travel limits."));
+    return;
+  }
+  // Exposed lines must run at the configured speed without waypoint pauses.
+  if (exposed_end_offset_mm) {
+    auto clearance = motor_->GetApproachDistance();
+    if (!clearance ||
+        *position + *exposed_end_offset_mm + *clearance > limits->maximum_mm) {
+      emit RequestFinished(
+          id,
+          clearance
+              ? errors::Error::InvalidArgument(
+                    "An exposed scan line enters the software limit slowdown "
+                    "region. Move the scan origin or reduce the speed.")
+              : clearance.error());
+      return;
+    }
+  }
   emit PositionCaptured(id, *position);
   emit RequestFinished(id, errors::Error::Ok());
 }
 void MotorWorker::MoveAbsolute(RequestId id, double position_mm) {
   if (!CheckReady(id)) return;
   // Skip unchanged targets, which may not emit a completion event.
-  if (motor_ && !pending_motion_ && !pending_stop_ &&
-      std::isfinite(position_mm)) {
-    auto position = motor_->GetPosition();
-    auto resolution = motor_->GetDistanceResolution();
-    if (position && resolution &&
-        std::abs(*position - position_mm) < *resolution / 2) {
-      emit RequestFinished(id, errors::Error::Ok());
-      return;
-    }
+  const auto at_target = motor_->IsAtPosition(position_mm);
+  if (!at_target || *at_target) {
+    emit RequestFinished(id,
+                         at_target ? errors::Error::Ok() : at_target.error());
+    return;
   }
   StartMotion(id, thorlabs::MotorEvent::kMoveCompleted, [this, position_mm] {
     return motor_->StartMoveAbsolute(position_mm);
@@ -205,7 +287,7 @@ void MotorWorker::Jog(RequestId id, thorlabs::Direction direction) {
 }
 void MotorWorker::Drive(RequestId id, thorlabs::Direction direction) {
   StartMotion(
-      id, thorlabs::MotorEvent::kStopped,
+      id, thorlabs::MotorEvent::kMoveCompleted,
       [this, direction] { return motor_->StartDrive(direction); }, true);
 }
 
@@ -237,6 +319,8 @@ void MotorWorker::Stop(RequestId id, thorlabs::StopMode mode) {
 void MotorWorker::FinishMotion(errors::Error result) {
   if (!pending_motion_) return;
   const auto id = pending_motion_->id;
+  SetThreadExecutionState(ES_CONTINUOUS |
+                          pending_motion_->previous_execution_state);
   pending_motion_.reset();
   if (!pending_stop_) motion_timer_->stop();
   emit RequestFinished(id, result);
@@ -246,9 +330,7 @@ void MotorWorker::FinishStop(errors::Error result) {
   const auto id = *pending_stop_;
   pending_stop_.reset();
   motion_timer_->stop();
-  const bool normal_drive_stop =
-      pending_motion_ &&
-      pending_motion_->completion_event == thorlabs::MotorEvent::kStopped;
+  const bool normal_drive_stop = pending_motion_ && pending_motion_->drive;
   FinishMotion(result.ok() && !normal_drive_stop
                    ? errors::Error::Failure(errors::ErrorCode::kCancelled,
                                             "Motion stopped.")
@@ -292,6 +374,11 @@ void MotorWorker::PollDevice() {
     // two polling ticks before acknowledging the stop request.
     if (stop_idle_polls_ >= 2) FinishStop(errors::Error::Ok());
   }
+  // The home event can arrive before the SDK's polled homed bit is current.
+  // A caller may issue its next move as soon as it receives this result.
+  if (!pending_stop_ && pending_motion_ && pending_motion_->home_event_seen &&
+      status->homed && !IsMoving(*status))
+    FinishMotion(errors::Error::Ok());
   // Bound queue draining so other queued commands, especially Stop, can run.
   for (int i = 0; i < 64; ++i) {
     auto event = motor_->GetNextEvent();
@@ -306,9 +393,12 @@ void MotorWorker::PollDevice() {
       continue;  // Confirm stopping through status, not a stale event.
     if (!pending_motion_) continue;
     // Let scanning turn the laser off without extra idle polls or retries.
-    if (**event == pending_motion_->completion_event)
-      FinishMotion(errors::Error::Ok());
-    else if (**event == thorlabs::MotorEvent::kStopped)
+    if (**event == pending_motion_->completion_event) {
+      if (**event == thorlabs::MotorEvent::kHomed)
+        pending_motion_->home_event_seen = true;
+      else
+        FinishMotion(errors::Error::Ok());
+    } else if (**event == thorlabs::MotorEvent::kStopped)
       FinishMotion(
           errors::Error::Failure(errors::ErrorCode::kCancelled,
                                  "Motor stopped before completing the move."));

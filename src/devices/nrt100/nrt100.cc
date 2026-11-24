@@ -1,7 +1,10 @@
 #include "nrt100/nrt100.h"
 
+#include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <expected>
+#include <format>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -102,7 +105,8 @@ NRT100::NRT100(std::string serial_number, short channel,
 
 NRT100::CreateResult NRT100::CreateMotor(
     std::string serial_number, short channel, int polling_interval_ms,
-    std::shared_ptr<const KinesisSimulation> simulation, StageModel stage) {
+    std::shared_ptr<const KinesisSimulation> simulation, StageModel stage,
+    std::optional<TravelLimits> limits) {
   auto device = std::unique_ptr<NRT100>(
       new NRT100(serial_number, channel, std::move(simulation), stage));
 
@@ -127,7 +131,12 @@ NRT100::CreateResult NRT100::CreateMotor(
     return std::unexpected(status);
   }
 
-  // Enable Channel
+  // Reserve two feedback intervals to decelerate near a software limit.
+  device->approach_time_s_ = 2.0 * polling_interval_ms / 1000;
+  // Apply the saved travel range before enabling the channel.
+  status = device->SetTravelLimits(
+      limits.value_or(TravelLimits{0, device->GetTravelMm()}));
+  if (!status.ok()) return std::unexpected(status);
   status = EnableChannel(serial_number, channel);
   if (!status.ok()) {
     return std::unexpected(status);
@@ -202,8 +211,45 @@ std::expected<int, Error> ConvertMotionParameter(
   return device_units;
 }
 
+struct StageMotionLimits {
+  double speed;
+  double acceleration;
+};
+
+std::expected<StageMotionLimits, Error> ReadStageMotionLimits(
+    const std::string& serial_number, short channel) {
+  StageMotionLimits limits{};
+  auto status = Error::FromKinesis(SBC_GetMotorVelocityLimits(
+      serial_number.c_str(), channel, &limits.speed, &limits.acceleration));
+  if (!status.ok()) return std::unexpected(status);
+  if (!(std::isfinite(limits.speed) && limits.speed > 0 &&
+        std::isfinite(limits.acceleration) && limits.acceleration > 0))
+    return std::unexpected(
+        Error::InvalidArgument("Cannot verify the stage motion limits."));
+  return limits;
+}
+
+Error CheckVelocityLimits(const std::string& serial_number, short channel,
+                          VelocityParameters update) {
+  auto limits = ReadStageMotionLimits(serial_number, channel);
+  if (!limits) return limits.error();
+  if (update.speed_mm_per_second && *update.speed_mm_per_second > limits->speed)
+    return Error::InvalidArgument(std::format(
+        "Speed exceeds the stage maximum of {} mm/s.", limits->speed));
+  if (update.acceleration_mm_per_second_squared &&
+      *update.acceleration_mm_per_second_squared > limits->acceleration)
+    return Error::InvalidArgument(
+        std::format("Acceleration exceeds the stage maximum of {} mm/s².",
+                    limits->acceleration));
+  return Error::Ok();
+}
+
 Error ApplyVelocity(const std::string& serial_number, short channel,
                     VelocityParameters update, bool jog) {
+  if (!update.speed_mm_per_second && !update.acceleration_mm_per_second_squared)
+    return Error::Ok();
+  auto limits = CheckVelocityLimits(serial_number, channel, update);
+  if (!limits.ok()) return limits;
   std::optional<int> speed, acceleration;
   if (update.speed_mm_per_second) {
     auto converted = ConvertMotionParameter(
@@ -218,7 +264,6 @@ Error ApplyVelocity(const std::string& serial_number, short channel,
     if (!converted) return converted.error();
     acceleration = *converted;
   }
-  if (!speed && !acceleration) return Error::Ok();
   int device_speed = 0, device_acceleration = 0;
   const char* serial = serial_number.c_str();
   auto status = Error::FromKinesis(
@@ -260,6 +305,11 @@ NRT100::PositionResult NRT100::GetPosition() {
 Error NRT100::SetMoveVelocity(VelocityParameters parameters) {
   auto connection = CheckConnection();
   if (!connection.ok()) return connection;
+  if (parameters.speed_mm_per_second ||
+      parameters.acceleration_mm_per_second_squared) {
+    auto restored = RestoreMoveProfile();
+    if (!restored.ok()) return restored;
+  }
   return ApplyVelocity(serial_number_, channel_, parameters, false);
 }
 
@@ -271,17 +321,40 @@ std::expected<MotorConfiguration, Error> NRT100::GetConfiguration() {
                                                &acceleration, &speed));
   if (!status.ok()) return std::unexpected(status);
   MotorConfiguration configuration{};
-  const auto read = [this](int units, int type, double& value) {
-    return Error::FromKinesis(SBC_GetRealValueFromDeviceUnit(
+  auto limits = ReadStageMotionLimits(serial_number_, channel_);
+  if (!limits) return std::unexpected(limits.error());
+  const auto read = [this](int units, int type, double& value,
+                           std::optional<double> maximum = std::nullopt) {
+    auto result = Error::FromKinesis(SBC_GetRealValueFromDeviceUnit(
         serial_number_.c_str(), channel_, units, &value, type));
+    // Quantizing the exact maximum can yield a readback slightly above it.
+    // Display the maximum if it reproduces the controller's exact count.
+    if (result.ok() && maximum && value > *maximum) {
+      auto maximum_units =
+          ConvertMotionParameter(serial_number_, channel_, *maximum, type);
+      if (!maximum_units) return maximum_units.error();
+      if (units == *maximum_units) value = *maximum;
+    }
+    return result;
   };
-  status = read(acceleration, kUnitTypeAcceleration,
-                configuration.acceleration_mm_per_second_squared);
+  status =
+      read(original_profile_ ? original_profile_->speed : speed, kUnitTypeSpeed,
+           configuration.move_speed_mm_per_second, limits->speed);
+  if (!status.ok()) return std::unexpected(status);
+  status = read(SBC_GetJogStepSize(serial_number_.c_str(), channel_),
+                kUnitTypeDistance, configuration.jog_step_mm);
+  if (!status.ok()) return std::unexpected(status);
+  status = read(
+      original_profile_ ? original_profile_->acceleration : acceleration,
+      kUnitTypeAcceleration, configuration.acceleration_mm_per_second_squared,
+      limits->acceleration);
   if (!status.ok()) return std::unexpected(status);
   status = read(SBC_GetHomingVelocity(serial_number_.c_str(), channel_),
-                kUnitTypeSpeed, configuration.homing_speed_mm_per_second);
+                kUnitTypeSpeed, configuration.homing_speed_mm_per_second,
+                limits->speed);
   if (!status.ok()) return std::unexpected(status);
-  status = read(SBC_GetBacklash(serial_number_.c_str(), channel_),
+  status = read(configured_backlash_.value_or(
+                    SBC_GetBacklash(serial_number_.c_str(), channel_)),
                 kUnitTypeDistance, configuration.backlash_mm);
   if (!status.ok()) return std::unexpected(status);
   return configuration;
@@ -290,18 +363,155 @@ std::expected<MotorConfiguration, Error> NRT100::GetConfiguration() {
 NRT100::PositionResult NRT100::GetDistanceResolution() {
   auto connection = CheckConnection();
   if (!connection.ok()) return std::unexpected(connection);
-  double resolution = 0;
-  const auto status = Error::FromKinesis(SBC_GetRealValueFromDeviceUnit(
-      serial_number_.c_str(), channel_, 1, &resolution, kUnitTypeDistance));
+  // The rounded mm readback of a single count is too coarse for this ratio.
+  auto units =
+      ConvertMotionParameter(serial_number_, channel_, 1.0, kUnitTypeDistance);
+  if (!units) return std::unexpected(units.error());
+  return 1.0 / *units;
+}
+
+NRT100::PositionResult NRT100::GetApproachDistance() {
+  int acceleration = 0, speed = 0;
+  auto status = Error::FromKinesis(SBC_GetVelParams(
+      serial_number_.c_str(), channel_, &acceleration, &speed));
+  if (!status.ok()) return std::unexpected(status);
+  double mm_per_second = 0;
+  status = Error::FromKinesis(SBC_GetRealValueFromDeviceUnit(
+      serial_number_.c_str(), channel_,
+      original_profile_ ? original_profile_->speed : speed, &mm_per_second,
+      kUnitTypeSpeed));
+  if (!status.ok()) return std::unexpected(status);
+  return mm_per_second * approach_time_s_;
+}
+
+Error NRT100::SetTravelLimits(TravelLimits limits) {
+  if (!std::isfinite(limits.minimum_mm) || !std::isfinite(limits.maximum_mm) ||
+      limits.minimum_mm >= limits.maximum_mm) {
+    return Error::InvalidArgument("Minimum must be less than maximum.");
+  }
+  if (limits.minimum_mm < 0 || limits.maximum_mm > GetTravelMm()) {
+    return Error::InvalidArgument(
+        "Software travel limits must be within the stage travel.");
+  }
+  auto connection = CheckConnection();
+  if (!connection.ok()) return connection;
+  const char* serial = serial_number_.c_str();
+  auto convert = [&](double mm, int& counts) {
+    return Error::FromKinesis(SBC_GetDeviceUnitFromRealValue(
+        serial, channel_, mm, &counts, kUnitTypeDistance));
+  };
+  int low = 0, high = 0, counts_per_mm = 0;
+  auto status = convert(limits.minimum_mm, low);
+  if (!status.ok()) return status;
+  status = convert(limits.maximum_mm, high);
+  if (!status.ok()) return status;
+  status = convert(1.0, counts_per_mm);
+  if (!status.ok()) return status;
+  if (counts_per_mm <= 0) return Error::FromKinesis(FT_InvalidParameter);
+  auto speed_scale =
+      ConvertMotionParameter(serial_number_, channel_, 1.0, kUnitTypeSpeed);
+  if (!speed_scale) return speed_scale.error();
+  auto acceleration_scale = ConvertMotionParameter(serial_number_, channel_,
+                                                   1.0, kUnitTypeAcceleration);
+  if (!acceleration_scale) return acceleration_scale.error();
+  // The supported NRT stages have an integral number of counts per mm.
+  // Correct outward rounding when an endpoint is between two counts.
+  if (low < limits.minimum_mm * counts_per_mm) ++low;
+  if (high > limits.maximum_mm * counts_per_mm) --high;
+  if (low >= high)
+    return Error::InvalidArgument(
+        "Software travel limits are too close for the stage resolution.");
+  MOT_LimitSwitchParameters switches{};
+  status = Error::FromKinesis(
+      SBC_GetLimitSwitchParamsBlock(serial, channel_, &switches));
+  if (!status.ok()) return status.WithContext("Read limit switches");
+  // Preserve the stage profile's physical switch configuration. The SDK's
+  // channel API expresses both software switch positions in device units.
+  switches.anticlockwisePosition = static_cast<DWORD>(low);
+  switches.clockwisePosition = static_cast<DWORD>(high);
+  switches.softLimitMode = MOT_LimitSwitchStopImmediate;
+  status = Error::FromKinesis(
+      SBC_SetLimitSwitchParamsBlock(serial, channel_, &switches));
   if (!status.ok()) {
-    return std::unexpected(status);
+    limits_.reset();
+    return status.WithContext("Set software limit switches");
   }
-
-  if (!std::isfinite(resolution) || resolution <= 0) {
-    return std::unexpected(Error::FromKinesis(FT_InvalidParameter));
+  MOT_LimitSwitchParameters confirmed{};
+  status = Error::FromKinesis(
+      SBC_GetLimitSwitchParamsBlock(serial, channel_, &confirmed));
+  if (!status.ok() ||
+      confirmed.anticlockwisePosition != switches.anticlockwisePosition ||
+      confirmed.clockwisePosition != switches.clockwisePosition ||
+      confirmed.softLimitMode != switches.softLimitMode ||
+      confirmed.clockwiseHardwareLimit != switches.clockwiseHardwareLimit ||
+      confirmed.anticlockwiseHardwareLimit !=
+          switches.anticlockwiseHardwareLimit) {
+    limits_.reset();
+    return Error::InvalidArgument(
+        "Kinesis did not confirm the limit switch settings. Reapply the limits "
+        "before moving.");
   }
+  SBC_SetLimitsSoftwareApproachPolicy(serial, channel_, DisallowIllegalMoves);
+  auto result =
+      Error::FromKinesis(SBC_SetStageAxisLimits(serial, channel_, low, high));
+  const int actual_low = SBC_GetStageAxisMinPos(serial, channel_);
+  const int actual_high = SBC_GetStageAxisMaxPos(serial, channel_);
+  const bool rejecting =
+      SBC_GetSoftLimitMode(serial, channel_) == DisallowIllegalMoves;
+  if (!result.ok() || !rejecting || actual_low != low || actual_high != high) {
+    limits_.reset();
+    if (!result.ok()) return result.WithContext("Set software travel limits");
+    return Error::InvalidArgument(
+        "Kinesis did not confirm the software travel limits. Reapply them "
+        "before moving.");
+  }
+  minimum_units_ = low;
+  maximum_units_ = high;
+  // Position entries and the readout resolve 0.001 mm. Keep boundary targets
+  // one quarter of that increment inside the limit to allow final settling.
+  constexpr double kEndpointMarginMm = 0.00025;
+  endpoint_margin_units_ =
+      std::min(static_cast<int>(std::ceil(counts_per_mm * kEndpointMarginMm)),
+               (high - low - 1) / 2);
+  velocity_units_per_count_per_second_ =
+      static_cast<double>(*speed_scale) / counts_per_mm;
+  acceleration_units_per_count_per_second_squared_ =
+      static_cast<double>(*acceleration_scale) / counts_per_mm;
+  limits_ = limits;
+  return Error::Ok();
+}
 
-  return resolution;
+Error NRT100::CheckReferenced() const {
+  auto connection = CheckConnection();
+  if (!connection.ok()) return connection;
+  if (!limits_)
+    return Error::InvalidArgument(
+        "Apply software travel limits before moving.");
+  if ((SBC_GetStatusBits(serial_number_.c_str(), channel_) & 0x00000400u) == 0)
+    return Error::InvalidArgument(
+        "Home the axis before moving within the software travel limits.");
+  return Error::Ok();
+}
+
+std::expected<int, Error> NRT100::TargetUnits(double position_mm) {
+  auto status = CheckReferenced();
+  if (!status.ok()) return std::unexpected(status);
+  if (!limits_->Contains(position_mm))
+    return std::unexpected(Error::InvalidArgument(
+        "Target is outside the applied software travel limits."));
+  int units = 0;
+  status = Error::FromKinesis(
+      SBC_GetDeviceUnitFromRealValue(serial_number_.c_str(), channel_,
+                                     position_mm, &units, kUnitTypeDistance));
+  if (!status.ok()) return std::unexpected(status);
+  return std::clamp(units, minimum_units_ + endpoint_margin_units_,
+                    maximum_units_ - endpoint_margin_units_);
+}
+
+std::expected<bool, Error> NRT100::IsAtPosition(double position_mm) {
+  auto target = TargetUnits(position_mm);
+  if (!target) return std::unexpected(target.error());
+  return SBC_GetPosition(serial_number_.c_str(), channel_) == *target;
 }
 
 Error NRT100::SetJogVelocity(VelocityParameters parameters) {
@@ -313,6 +523,9 @@ Error NRT100::SetJogVelocity(VelocityParameters parameters) {
 Error NRT100::SetHomingSpeed(double speed) {
   auto connection = CheckConnection();
   if (!connection.ok()) return connection;
+  auto limits = CheckVelocityLimits(serial_number_, channel_,
+                                    {.speed_mm_per_second = speed});
+  if (!limits.ok()) return limits;
   auto converted =
       ConvertMotionParameter(serial_number_, channel_, speed, kUnitTypeSpeed);
   if (!converted) {
@@ -330,21 +543,46 @@ Error NRT100::SetBacklash(double distance_mm) {
     return Error::InvalidArgument(
         "Backlash must be a finite, non-negative distance in mm.");
   }
-  if (distance_mm == 0.0) {
-    return Error::FromKinesis(
-        SBC_SetBacklash(serial_number_.c_str(), channel_, 0));
+  int units = 0;
+  if (distance_mm > 0) {
+    auto converted = ConvertMotionParameter(serial_number_, channel_,
+                                            distance_mm, kUnitTypeDistance);
+    if (!converted) return converted.error();
+    units = *converted;
   }
+  auto result = Error::FromKinesis(
+      SBC_SetBacklash(serial_number_.c_str(), channel_, units));
+  if (result.ok()) configured_backlash_.reset();
+  return result;
+}
 
-  auto converted = ConvertMotionParameter(serial_number_, channel_, distance_mm,
-                                          kUnitTypeDistance);
-  if (!converted) return converted.error();
-  return Error::FromKinesis(
-      SBC_SetBacklash(serial_number_.c_str(), channel_, *converted));
+Error NRT100::LimitBacklashForTarget(int target_units) {
+  const char* serial = serial_number_.c_str();
+  const long current = SBC_GetBacklash(serial, channel_);
+  const long requested = configured_backlash_.value_or(current);
+  // A compensated move may pass its target and then approach it again.
+  const long allowed =
+      std::clamp<long>(requested, (target_units - maximum_units_) / 2,
+                       (target_units - minimum_units_) / 2);
+  if (current != allowed) {
+    auto result =
+        Error::FromKinesis(SBC_SetBacklash(serial, channel_, allowed));
+    if (!result.ok()) return result.WithContext("Limit backlash for move");
+    configured_backlash_ = requested;
+    if (SBC_GetBacklash(serial, channel_) != allowed)
+      return Error::InvalidArgument(
+          "Kinesis did not confirm the backlash correction for this move.");
+  }
+  if (allowed == requested) configured_backlash_.reset();
+  return Error::Ok();
 }
 
 Error NRT100::SetJogStepSize(double step) {
   auto connection = CheckConnection();
   if (!connection.ok()) return connection;
+  if (step > GetTravelMm())
+    return Error::InvalidArgument(
+        "Jog step exceeds the selected stage travel.");
   auto converted =
       ConvertMotionParameter(serial_number_, channel_, step, kUnitTypeDistance);
   if (!converted) {
@@ -372,42 +610,58 @@ Error NRT100::SetJogMode(JogMode mode, StopMode stop_mode) {
 Error NRT100::StartHome() {
   auto connection = CheckConnection();
   if (!connection.ok()) return connection;
+  auto restored = RestoreMoveProfile();
+  if (!restored.ok()) return restored;
   return Error::FromKinesis(SBC_Home(serial_number_.c_str(), channel_));
 }
 
 Error NRT100::StartJog(Direction dir) {
-  auto connection = CheckConnection();
+  auto connection = CheckReferenced();
   if (!connection.ok()) return connection;
   if (dir != Direction::kForward && dir != Direction::kBackward)
     return Error::FromKinesis(FT_InvalidParameter);
-  MOT_TravelDirection mot_direction;
+  const char* serial = serial_number_.c_str();
+  MOT_JogModes mode;
+  MOT_StopModes stop;
+  auto status =
+      Error::FromKinesis(SBC_GetJogMode(serial, channel_, &mode, &stop));
+  if (!status.ok()) return status;
+  if (mode != MOT_SingleStep)
+    return Error::InvalidArgument(
+        "Jog requires single-step mode with software travel limits.");
+  const std::int64_t step = SBC_GetJogStepSize(serial, channel_);
+  const std::int64_t current = SBC_GetPosition(serial, channel_);
+  const bool forward = dir == Direction::kForward;
+  const std::int64_t target = current + (forward ? step : -step);
+  // The position and jog step are rounded separately. At a fractional-mm
+  // boundary the nominal endpoint can differ by one count.
+  const auto bounded =
+      std::clamp<std::int64_t>(target, minimum_units_, maximum_units_);
+  if (step == 0 || std::abs(bounded - target) > 1 || bounded == current)
+    return Error::InvalidArgument(
+        "Jog target is outside the applied software travel limits.");
 
-  if (dir == Direction::kForward) {
-    mot_direction = MOT_TravelDirection::MOT_Forwards;
-  } else {
-    mot_direction = MOT_TravelDirection::MOT_Reverse;
-  }
-
-  return Error::FromKinesis(
-      SBC_MoveJog(serial_number_.c_str(), channel_, mot_direction));
+  const int destination = std::clamp(static_cast<int>(bounded),
+                                     minimum_units_ + endpoint_margin_units_,
+                                     maximum_units_ - endpoint_margin_units_);
+  if (forward ? destination <= current : destination >= current)
+    return Error::InvalidArgument("Jog is at the software travel limit.");
+  return StartPositionedMove(destination, true);
 }
 
 Error NRT100::StartDrive(Direction dir) {
-  auto connection = CheckConnection();
+  auto connection = CheckReferenced();
   if (!connection.ok()) return connection;
   if (dir != Direction::kForward && dir != Direction::kBackward)
     return Error::FromKinesis(FT_InvalidParameter);
 
-  MOT_TravelDirection mot_direction;
-
-  if (dir == Direction::kForward) {
-    mot_direction = MOT_TravelDirection::MOT_Forwards;
-  } else {
-    mot_direction = MOT_TravelDirection::MOT_Reverse;
-  }
-
-  return Error::FromKinesis(
-      SBC_MoveAtVelocity(serial_number_.c_str(), channel_, mot_direction));
+  const int current = SBC_GetPosition(serial_number_.c_str(), channel_);
+  const bool forward = dir == Direction::kForward;
+  if (forward ? current >= maximum_units_ - endpoint_margin_units_
+              : current <= minimum_units_ + endpoint_margin_units_)
+    return Error::InvalidArgument(
+        "Drive is at or beyond the software travel limit in this direction.");
+  return StartMoveAbsolute(forward ? limits_->maximum_mm : limits_->minimum_mm);
 }
 
 Error NRT100::Stop(StopMode stop_mode) {
@@ -415,6 +669,7 @@ Error NRT100::Stop(StopMode stop_mode) {
   if (!connection.ok()) return connection;
   if (stop_mode != StopMode::kProfiled && stop_mode != StopMode::kImmediate)
     return Error::InvalidArgument("Invalid stop mode.");
+  approach_.reset();
   if (stop_mode == StopMode::kProfiled) {
     return Error::FromKinesis(
         SBC_StopProfiled(serial_number_.c_str(), channel_));
@@ -425,21 +680,102 @@ Error NRT100::Stop(StopMode stop_mode) {
 }
 
 Error NRT100::StartMoveAbsolute(double position) {
-  auto connection = CheckConnection();
-  if (!connection.ok()) return connection;
-  if (!std::isfinite(position) || position < 0.0 || position > GetTravelMm())
+  auto target = TargetUnits(position);
+  if (!target) return target.error();
+  return StartPositionedMove(*target);
+}
+
+Error NRT100::RestoreMoveProfile() {
+  if (!original_profile_) return Error::Ok();
+  auto result = Error::FromKinesis(SBC_SetVelParams(
+      serial_number_.c_str(), channel_, original_profile_->acceleration,
+      original_profile_->speed));
+  if (result.ok()) original_profile_.reset();
+  return result;
+}
+
+Error NRT100::StartPositionedMove(int target, bool jog) {
+  auto result = RestoreMoveProfile();
+  if (!result.ok()) return result;
+  const char* serial = serial_number_.c_str();
+  VelocityProfile profile{};
+  result = Error::FromKinesis(
+      jog ? SBC_GetJogVelParams(serial, channel_, &profile.acceleration,
+                                &profile.speed)
+          : SBC_GetVelParams(serial, channel_, &profile.acceleration,
+                             &profile.speed));
+  if (!result.ok()) return result;
+  if (profile.speed <= 0 || profile.acceleration <= 0)
     return Error::InvalidArgument(
-        "Position is outside the selected stage travel.");
-  int device_unit = 0;
-  auto status = Error::FromKinesis(
-      SBC_GetDeviceUnitFromRealValue(serial_number_.c_str(), channel_, position,
-                                     &device_unit, kUnitTypeDistance));
-  if (!status.ok()) return status;
-  return Error::FromKinesis(
-      SBC_MoveToPosition(serial_number_.c_str(), channel_, device_unit));
+        "Motion requires a positive speed and acceleration.");
+  const int current = SBC_GetPosition(serial, channel_);
+  approach_ =
+      Approach{target, current, profile, std::min(current, minimum_units_),
+               std::max(current, maximum_units_)};
+  result = StartApproachSegment(current, jog);
+  if (!result.ok()) approach_.reset();
+  return result;
+}
+
+Error NRT100::StartApproachSegment(int from, bool jog) {
+  const char* serial = serial_number_.c_str();
+  const int target = approach_->target;
+  const int sign = target >= from ? 1 : -1;
+  const int edge = sign > 0 ? maximum_units_ : minimum_units_;
+  const std::int64_t remaining =
+      std::abs(static_cast<std::int64_t>(edge) - from);
+  const auto profile = approach_->profile;
+  // Leave room for following error during deceleration. Only subdivide a
+  // move if the requested target is closer to the edge than that allowance.
+  const double guard =
+      profile.speed / velocity_units_per_count_per_second_ * approach_time_s_;
+  // A one-unit acceleration is the slowest ramp the controller can express.
+  // Below its ramp distance, finish directly using that minimum ramp.
+  const double ramp_counts = approach_time_s_ * approach_time_s_ /
+                             acceleration_units_per_count_per_second_squared_;
+  const int reserve =
+      remaining <= 4 * ramp_counts
+          ? 0
+          : static_cast<int>(std::min<double>(guard, remaining / 4));
+  // A newly applied range may exclude the current position. Even the first
+  // waypoint used to re-enter that range must be a legal destination.
+  const int waypoint =
+      std::clamp(edge - sign * std::max(std::abs(edge - target), reserve),
+                 minimum_units_, maximum_units_);
+  const int clearance = std::abs(edge - waypoint);
+  const double max_speed = std::max<double>(ramp_counts, clearance) *
+                           velocity_units_per_count_per_second_ /
+                           approach_time_s_;
+  const int speed =
+      std::max(1, static_cast<int>(std::min<double>(profile.speed, max_speed)));
+  const int acceleration =
+      speed == profile.speed
+          ? profile.acceleration
+          : std::max(1,
+                     static_cast<int>(std::min<double>(
+                         profile.acceleration,
+                         speed / velocity_units_per_count_per_second_ *
+                             acceleration_units_per_count_per_second_squared_ /
+                             approach_time_s_)));
+  approach_->waypoint = waypoint;
+  auto result = LimitBacklashForTarget(waypoint);
+  if (!result.ok()) return result;
+  if (jog || speed != profile.speed || original_profile_) {
+    if (!original_profile_) {
+      VelocityProfile previous{};
+      result = Error::FromKinesis(SBC_GetVelParams(
+          serial, channel_, &previous.acceleration, &previous.speed));
+      if (!result.ok()) return result;
+      original_profile_ = previous;
+    }
+    result = Error::FromKinesis(
+        SBC_SetVelParams(serial, channel_, acceleration, speed));
+    if (!result.ok()) return result;
+  }
+  return Error::FromKinesis(SBC_MoveToPosition(serial, channel_, waypoint));
 }
 Error NRT100::StartMoveRelative(double distance) {
-  auto connection = CheckConnection();
+  auto connection = CheckReferenced();
   if (!connection.ok()) return connection;
   if (!std::isfinite(distance) || distance < -GetTravelMm() ||
       distance > GetTravelMm()) {
@@ -448,25 +784,12 @@ Error NRT100::StartMoveRelative(double distance) {
 
   auto position = GetPosition();
   if (!position) return position.error();
-  if (*position + distance < 0.0 || *position + distance > GetTravelMm())
-    return Error::InvalidArgument(
-        "Relative target is outside the selected stage travel.");
-  int device_units = 0;
-  auto conversion_status = Error::FromKinesis(
-      SBC_GetDeviceUnitFromRealValue(serial_number_.c_str(), channel_, distance,
-                                     &device_units, kUnitTypeDistance));
-  if (!conversion_status.ok()) {
-    return conversion_status;
-  }
-
-  // A zero displacement may never produce the completion event the worker
-  // awaits.
-  if (device_units == 0) {
+  const auto target = TargetUnits(*position + distance);
+  if (!target) return target.error();
+  const int current = SBC_GetPosition(serial_number_.c_str(), channel_);
+  if (distance > 0 ? *target <= current : distance == 0 || *target >= current)
     return Error::MotionBelowResolution(serial_number_);
-  }
-  const short result =
-      SBC_MoveRelative(serial_number_.c_str(), channel_, device_units);
-  return Error::FromKinesis(result);
+  return StartPositionedMove(*target);
 }
 
 std::expected<MotorStatus, Error> NRT100::GetStatus() {
@@ -502,6 +825,29 @@ NRT100::EventResult NRT100::GetNextEvent() {
   if (!status.ok()) {
     return std::unexpected(status);
   }
+  if (approach_) {
+    const int position = SBC_GetPosition(serial_number_.c_str(), channel_);
+    if (position < approach_->observed_minimum ||
+        position > approach_->observed_maximum) {
+      auto stopped = Stop(StopMode::kImmediate);
+      if (!stopped.ok())
+        return std::unexpected(
+            stopped.WithContext("Travel limit crossed; immediate stop failed"));
+      double mm = 0;
+      const short converted = SBC_GetRealValueFromDeviceUnit(
+          serial_number_.c_str(), channel_, position, &mm, kUnitTypeDistance);
+      const std::string readback = converted == 0
+                                       ? std::to_string(mm) + " mm"
+                                       : std::to_string(position) + " counts";
+      return std::unexpected(Error::InvalidArgument(
+          "Position crossed a software travel limit at " + readback +
+          ". An immediate stop was requested."));
+    }
+    if (position >= minimum_units_)
+      approach_->observed_minimum = minimum_units_;
+    if (position <= maximum_units_)
+      approach_->observed_maximum = maximum_units_;
+  }
 
   WORD type = 0;
   WORD id = 0;
@@ -525,8 +871,22 @@ NRT100::EventResult NRT100::GetNextEvent() {
       case kHomedMessageId:
         return MotorEvent::kHomed;
       case kMovedMessageId:
+        if (approach_ && approach_->waypoint != approach_->target) {
+          const auto next = StartApproachSegment(approach_->waypoint, false);
+          if (!next.ok()) {
+            approach_.reset();
+            return std::unexpected(next);
+          }
+          return MotorEvent::kOther;
+        }
+        approach_.reset();
+        status = RestoreMoveProfile();
+        if (!status.ok()) return std::unexpected(status);
         return MotorEvent::kMoveCompleted;
       case kStoppedMessageId:
+        approach_.reset();
+        status = RestoreMoveProfile();
+        if (!status.ok()) return std::unexpected(status);
         return MotorEvent::kStopped;
     }
   }

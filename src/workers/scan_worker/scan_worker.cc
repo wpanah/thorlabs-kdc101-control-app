@@ -40,6 +40,8 @@ void ScanWorker::Start(ScanJob job) {
   }
   // Validate the program before any motor or laser requests are emitted.
   bool laser_on = false;
+  thorlabs::TravelLimits x_offsets{0, 0}, y_offsets{0, 0};
+  std::optional<double> last_exposed_x;
   std::optional<algo::MoveAbsolute> previous_move;
   for (const auto& instruction : job.instructions) {
     if (const auto* move = std::get_if<algo::MoveAbsolute>(&instruction)) {
@@ -52,10 +54,18 @@ void ScanWorker::Start(ScanJob job) {
       if (laser_on && (!previous_move || move->y_mm != previous_move->y_mm ||
                        move->x_mm <= previous_move->x_mm)) {
         emit Finished(errors::Error::InvalidArgument(
-            "Exposed scan moves must travel left to right without changing Y."));
+            "Exposed scan moves must travel left to right without changing "
+            "Y."));
         return;
       }
       previous_move = *move;
+      if (laser_on)
+        last_exposed_x =
+            std::max(last_exposed_x.value_or(move->x_mm), move->x_mm);
+      x_offsets.minimum_mm = std::min(x_offsets.minimum_mm, move->x_mm);
+      x_offsets.maximum_mm = std::max(x_offsets.maximum_mm, move->x_mm);
+      y_offsets.minimum_mm = std::min(y_offsets.minimum_mm, move->y_mm);
+      y_offsets.maximum_mm = std::max(y_offsets.maximum_mm, move->y_mm);
     } else {
       const auto action = std::get<algo::Action>(instruction);
       if (action != algo::Action::kLaserOn &&
@@ -82,12 +92,15 @@ void ScanWorker::Start(ScanJob job) {
   pending_x_ = NextRequestId();
   pending_y_ = NextRequestId();
   operation_timer_->start(static_cast<int>(job_.operation_timeout.count()));
-  emit PositionRequested(Axis::kX, *pending_x_);
-  emit PositionRequested(Axis::kY, *pending_y_);
+  emit PositionRequested(Axis::kX, *pending_x_, x_offsets.minimum_mm,
+                         x_offsets.maximum_mm, last_exposed_x);
+  emit PositionRequested(Axis::kY, *pending_y_, y_offsets.minimum_mm,
+                         y_offsets.maximum_mm, std::nullopt);
 }
 
 RequestId ScanWorker::NextRequestId() { return next_request_id_++; }
-void ScanWorker::OnPositionCaptured(Axis axis, RequestId id, double position_mm) {
+void ScanWorker::OnPositionCaptured(Axis axis, RequestId id,
+                                    double position_mm) {
   if (!capturing_origin_ || progress_.phase != ScanPhase::kRunning) return;
   if (axis == Axis::kX && pending_x_ == id) origin_x_mm_ = position_mm;
   if (axis == Axis::kY && pending_y_ == id) origin_y_mm_ = position_mm;
@@ -142,7 +155,8 @@ void ScanWorker::ExecuteNextInstruction() {
     const double x = origin_x_mm_ + move->x_mm;
     const double y = origin_y_mm_ + move->y_mm;
     if (!std::isfinite(x) || !std::isfinite(y)) {
-      BeginCleanup(errors::Error::InvalidArgument("Scan target is not finite."));
+      BeginCleanup(
+          errors::Error::InvalidArgument("Scan target is not finite."));
       return;
     }
     // Reposition both axes with the laser off. During exposure, keep Y
@@ -150,12 +164,10 @@ void ScanWorker::ExecuteNextInstruction() {
     // Allocate all needed IDs before emitting to support immediate replies.
     pending_x_ = NextRequestId();
     pending_y_ = program_laser_on_ ? std::nullopt
-                                 : std::optional<RequestId>{NextRequestId()};
+                                   : std::optional<RequestId>{NextRequestId()};
     operation_timer_->start(static_cast<int>(job_.motion_timeout.count()));
-    if (pending_x_)
-      emit MoveRequested(Axis::kX, *pending_x_, x);
-    if (pending_y_)
-      emit MoveRequested(Axis::kY, *pending_y_, y);
+    if (pending_x_) emit MoveRequested(Axis::kX, *pending_x_, x);
+    if (pending_y_) emit MoveRequested(Axis::kY, *pending_y_, y);
     return;
   }
   switch (std::get<algo::Action>(instruction)) {

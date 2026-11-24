@@ -205,8 +205,12 @@ void MainWindow::ConnectScanAxis(workers::ScanWorker* scan, Axis axis,
                                  workers::MotorWorker* motor) {
   connect(
       scan, &workers::ScanWorker::PositionRequested, motor,
-      [motor, axis](Axis requested, auto id) {
-        if (requested == axis) motor->CapturePosition(id);
+      [motor, axis](Axis requested, auto id, double minimum_offset_mm,
+                    double maximum_offset_mm,
+                    std::optional<double> exposed_end_offset_mm) {
+        if (requested == axis)
+          motor->CapturePosition(id, minimum_offset_mm, maximum_offset_mm,
+                                 exposed_end_offset_mm);
       },
       Qt::QueuedConnection);
   connect(

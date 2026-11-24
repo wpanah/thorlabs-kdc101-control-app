@@ -12,6 +12,14 @@ namespace thorlabs {
 using errors::Error;
 class KinesisSimulation;
 
+struct TravelLimits {
+  double minimum_mm;
+  double maximum_mm;
+  bool Contains(double position_mm) const {
+    return minimum_mm <= position_mm && position_mm <= maximum_mm;
+  }
+};
+
 // Installation notes (2026-10-26):
 // - Kinesis shows controller 70871422 with channels 1, 2 and 3.
 // - User-confirmed travel: X = 150 mm, Y = 100 mm, Z = 150 mm.
@@ -38,6 +46,11 @@ class NRT100 {
     return stage == StageModel::kNrt150M ? 150.0 : 100.0;
   }
   [[nodiscard]] double GetTravelMm() const { return TravelForStage(stage_); }
+  [[nodiscard]] std::optional<TravelLimits> GetTravelLimits() const {
+    return limits_;
+  }
+  [[nodiscard]] Error SetTravelLimits(TravelLimits limits);
+  [[nodiscard]] std::expected<bool, Error> IsAtPosition(double position_mm);
   enum class Direction { kForward, kBackward };
 
   enum class StopMode { kProfiled, kImmediate };
@@ -51,6 +64,8 @@ class NRT100 {
   };
 
   struct MotorConfiguration {
+    double move_speed_mm_per_second;
+    double jog_step_mm;
     double acceleration_mm_per_second_squared;
     double homing_speed_mm_per_second;
     double backlash_mm;
@@ -94,9 +109,11 @@ class NRT100 {
       std::string serial_number, short channel = 1,
       int polling_interval_ms = 200,
       std::shared_ptr<const KinesisSimulation> simulation = nullptr,
-      StageModel stage = StageModel::kNrt100M);
+      StageModel stage = StageModel::kNrt100M,
+      std::optional<TravelLimits> limits = std::nullopt);
 
   [[nodiscard]] PositionResult GetPosition();
+  [[nodiscard]] PositionResult GetApproachDistance();
   [[nodiscard]] PositionResult GetDistanceResolution();
   [[nodiscard]] std::expected<MotorStatus, Error> GetStatus();
   [[nodiscard]] std::expected<MotorConfiguration, Error> GetConfiguration();
@@ -123,12 +140,40 @@ class NRT100 {
   [[nodiscard]] Error ClearMessageQueue();
 
  private:
+  [[nodiscard]] Error CheckReferenced() const;
+  [[nodiscard]] std::expected<int, Error> TargetUnits(double position_mm);
+  [[nodiscard]] Error LimitBacklashForTarget(int target_units);
+  [[nodiscard]] Error StartPositionedMove(int target, bool jog = false);
+  [[nodiscard]] Error StartApproachSegment(int from, bool jog);
+  [[nodiscard]] Error RestoreMoveProfile();
+  struct VelocityProfile {
+    int acceleration;
+    int speed;
+  };
+  struct Approach {
+    int target;
+    int waypoint;
+    VelocityProfile profile;
+    int observed_minimum;
+    int observed_maximum;
+  };
   NRT100(std::string serial_number, short channel,
          std::shared_ptr<const KinesisSimulation> simulation, StageModel stage);
 
   const std::string serial_number_;
   const short channel_;
   const StageModel stage_;
+  std::optional<TravelLimits> limits_;
+  int minimum_units_ = 0;
+  int maximum_units_ = 0;
+  int endpoint_margin_units_ = 0;
+  double velocity_units_per_count_per_second_ = 0;
+  double acceleration_units_per_count_per_second_squared_ = 0;
+  double approach_time_s_ = 0;
+  std::optional<Approach> approach_;
+  std::optional<VelocityProfile> original_profile_;
+  // Original correction while a move near a boundary has limited clearance.
+  std::optional<long> configured_backlash_;
   std::shared_ptr<const KinesisSimulation> simulation_;
   bool connected_;
   bool polling_;

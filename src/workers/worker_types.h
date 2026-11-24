@@ -24,6 +24,7 @@ struct MotorSettings {
   std::optional<double> homing_speed_mm_per_second;
   std::optional<double> jog_step_mm;
   std::optional<double> backlash_mm;
+  std::optional<thorlabs::TravelLimits> travel_limits;
 };
 
 struct MotorState {

@@ -4,6 +4,7 @@
 #include <QObject>
 #include <QString>
 #include <QTimer>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -25,7 +26,10 @@ class MotorWorker final : public QObject {
   void DisconnectDevice(workers::RequestId id);
   void Configure(workers::RequestId id, workers::MotorSettings settings);
   void Home(workers::RequestId id);
-  void CapturePosition(workers::RequestId id);
+  void CapturePosition(
+      workers::RequestId id, double minimum_offset_mm = 0,
+      double maximum_offset_mm = 0,
+      std::optional<double> exposed_end_offset_mm = std::nullopt);
   void MoveAbsolute(workers::RequestId id, double position_mm);
   void MoveRelative(workers::RequestId id, double distance_mm);
   void Jog(workers::RequestId id, thorlabs::Direction direction);
@@ -46,6 +50,9 @@ class MotorWorker final : public QObject {
   struct PendingMotion {
     RequestId id;
     thorlabs::MotorEvent completion_event;
+    bool drive;
+    std::uint32_t previous_execution_state;
+    bool home_event_seen = false;
   };
 
   void PollDevice();
@@ -55,11 +62,11 @@ class MotorWorker final : public QObject {
   void FinishStop(errors::Error result);
   bool CheckReady(RequestId id);
   void StartMotion(RequestId id, thorlabs::MotorEvent completion,
-                   std::function<errors::Error()> command,
-                   bool continuous = false);
+                   std::function<errors::Error()> command, bool drive = false);
   void OnTimeout();
 
   const Axis axis_;
+  QString limits_key_;
   std::unique_ptr<thorlabs::NRT100> motor_;
   std::shared_ptr<const thorlabs::KinesisSimulation> simulation_;
   QTimer* poll_timer_ =
